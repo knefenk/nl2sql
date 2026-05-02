@@ -23,6 +23,11 @@ TOOL_CALL_RE = re.compile(
     r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL
 )
 
+# Also accept bare JSON: {"name": "...", "arguments": {...}}
+BARE_TOOL_RE = re.compile(
+    r'\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[^}]+\}\s*\}', re.DOTALL
+)
+
 
 def _get_client() -> OpenAI:
     return OpenAI(base_url=LLAMA_SERVER, api_key="not-needed")
@@ -69,14 +74,23 @@ def _maybe_compress(messages: list[dict], client: OpenAI) -> tuple[list[dict], b
 
 
 def _parse_tool_call(text: str) -> dict | None:
-    """Parse <tool_call>{"name": "...", "arguments": {...}}</tool_call> from text."""
+    """Parse tool call from text. Accepts both <tool_call> wrapper and bare JSON."""
+    # Try <tool_call> wrapper first
     match = TOOL_CALL_RE.search(text)
-    if not match:
-        return None
-    try:
-        data = json.loads(match.group(1).strip())
-    except json.JSONDecodeError:
-        return None
+    if match:
+        try:
+            data = json.loads(match.group(1).strip())
+        except json.JSONDecodeError:
+            return None
+    else:
+        # Try bare JSON: {"name": "...", "arguments": {...}}
+        match = BARE_TOOL_RE.search(text)
+        if not match:
+            return None
+        try:
+            data = json.loads(match.group(0).strip())
+        except json.JSONDecodeError:
+            return None
     name = data.get("name", "")
     args = data.get("arguments", {})
     if not name:
@@ -212,7 +226,7 @@ def run_agent(question: str, on_step=None) -> dict:
         if tc["name"] == "load_skill":
             skill = tc["args"].get("skill", "")
             if skill in SKILLS:
-                _feed_tool_response(messages, SKILLS[skill])
+                _feed_tool_response(messages, SKILLS[skill] + "\n\nNow call run_sql with your SQL query.")
                 _step("skill_injected", skill)
             continue
 
@@ -225,19 +239,20 @@ def run_agent(question: str, on_step=None) -> dict:
                 content = f"Error: {result['error']}"
                 if "duckdb-rules" not in str(messages[-6:]):
                     content += f"\n\n{SKILLS['duckdb-rules']}"
+                content += "\n\nFix the query and call run_sql again, or call schema_check to verify columns."
                 _feed_tool_response(messages, content)
                 retries += 1
                 _step("sql_error", result["error"])
             else:
                 formatted = _format_rows(result["columns"], result["rows"])
-                _feed_tool_response(messages, formatted)
+                _feed_tool_response(messages, formatted + "\n\nNow call explain to summarize these results.")
                 _step("sql_success", {"columns": result["columns"], "row_count": result["row_count"]})
             continue
 
         elif tc["name"] == "schema_check":
             table = tc["args"].get("table", "")
             columns = schema_lookup(table)
-            _feed_tool_response(messages, columns)
+            _feed_tool_response(messages, columns + "\n\nNow fix your query and call run_sql.")
             _step("schema_checked", table)
             continue
 
