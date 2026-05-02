@@ -25,33 +25,66 @@ if "messages" not in st.session_state:
 
 
 def _render_result(result: dict):
-    """Render agent result in a human-readable chat bubble."""
-    # Skill loaded
-    skill = result.get("skill_used", "unknown")
-    trips = result.get("trips", 0)
-    retries = result.get("retries", 0)
-    st.caption(f"skill: {skill}  |  trips: {trips}  |  retries: {retries}")
+    """Render agent tool calls chronologically, explain at bottom."""
+    steps = result.get("steps", [])
+    sql_shown = False
+    sql_error = None
 
-    # SQL
-    sql = result.get("sql")
-    if sql:
-        st.code(sql, language="sql")
+    for step in steps:
+        name = step["name"]
+        data = step.get("data")
 
-    # Results table
-    res = result.get("results")
-    if res and res.get("rows"):
-        df = pd.DataFrame(res["rows"], columns=res["columns"])
-        st.caption(f"{len(df)} rows")
-        st.dataframe(df, use_container_width=True, hide_index=True)
-    elif res and res.get("error"):
-        st.error(f"SQL Error: {res['error']}")
+        if name == "skill_loaded":
+            skill = data or "unknown"
+            with st.expander(f"load_skill: {skill}", expanded=False):
+                from skills import SKILLS
+                content = SKILLS.get(skill, "Skill not found.")
+                st.text(content[:1500])
+                if len(content) > 1500:
+                    st.caption("(truncated)")
 
-    # Explanation — the main human-readable answer
+        elif name == "fallback_skill":
+            st.caption(f"Classification failed, using fallback: {data}")
+
+        elif name == "tool:run_sql" and not sql_shown:
+            sql = data.get("sql", "") if isinstance(data, dict) else str(data)
+            st.code(sql, language="sql")
+            sql_shown = True
+
+        elif name == "sql_error":
+            sql_error = str(data) if data else "Unknown SQL error."
+            st.error(f"SQL error: {sql_error}")
+
+        elif name == "sql_success" and isinstance(data, dict):
+            res = result.get("results")
+            if res and res.get("rows"):
+                df = pd.DataFrame(res["rows"], columns=res["columns"])
+                st.caption(f"{len(df)} rows")
+                st.dataframe(df, use_container_width=True, hide_index=True)
+
+        elif name == "tool:schema_check":
+            table = data.get("table", "") if isinstance(data, dict) else str(data)
+            st.caption(f"Checking schema for: {table}")
+
+        elif name == "context_compressed":
+            st.caption("Context compressed to stay within token limit.")
+
+    # Explanation at the bottom
     answer = result.get("answer", "")
-    if answer:
+    if answer and answer != "Agent could not respond within the step limit.":
         st.markdown(answer)
-    elif not (res and res.get("rows")):
-        st.info("No results found.")
+    elif not (result.get("results") and result["results"].get("rows")):
+        if sql_error:
+            st.error(f"Query failed after {result.get('retries', 0)} retries.")
+        else:
+            st.info("No results found.")
+
+    # Footer
+    st.caption(
+        f"skill: {result.get('skill_used', '?')}  |  "
+        f"trips: {result.get('trips', 0)}  |  "
+        f"retries: {result.get('retries', 0)}"
+    )
 
 
 def _handle_query(question: str) -> dict:
