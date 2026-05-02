@@ -1,0 +1,11 @@
+[project]
+name = "nl2sql-agent"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.11"
+dependencies = [
+    "duckdb>=1.5.2",
+    "openai>=2.33.0",
+    "pandas>=3.0.2",
+    "streamlit>=1.57.0",
+]
