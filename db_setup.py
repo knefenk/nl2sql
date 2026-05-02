@@ -52,7 +52,7 @@ def create_database() -> None:
         "segment": random.choices(SEGMENTS, weights=[0.40, 0.30, 0.10, 0.20], k=50),
         "age": [random.randint(21, 75) for _ in range(50)],
         "city": random.choices(CITIES, k=50),
-        "join_date": [_rand_date(datetime(2020, 1, 1), 1800) for _ in range(50)],
+        "join_date": [_rand_date(datetime(2023, 1, 1), 1095) for _ in range(50)],
     })
 
     accounts = []
@@ -67,7 +67,7 @@ def create_database() -> None:
                 "account_type": atype,
                 "balance": balance,
                 "currency": random.choice(CURRENCIES),
-                "opened_date": _rand_date(datetime(2021, 1, 1), 1500),
+                "opened_date": _rand_date(datetime(2023, 1, 1), 1000),
             })
             acc_id += 1
     accounts_df = pd.DataFrame(accounts)
@@ -81,8 +81,8 @@ def create_database() -> None:
             is_credit = cat in CREDIT_CATEGORIES
             amount = round(random.uniform(1000, 25000), 2) if is_credit else -round(random.uniform(10, 5000), 2)
             txn_date = base_date + timedelta(days=random.randint(1, 365))
-            if txn_date > datetime(2025, 4, 1):
-                txn_date = datetime(2025, 4, 1) - timedelta(days=random.randint(1, 90))
+            if txn_date > datetime(2025, 12, 31):
+                txn_date = datetime(2025, 12, 31) - timedelta(days=random.randint(1, 90))
             txns.append({
                 "transaction_id": txn_id,
                 "account_id": acc["account_id"],
@@ -112,7 +112,7 @@ def create_database() -> None:
                 "principal": principal,
                 "interest_rate": rate,
                 "remaining_balance": remaining,
-                "start_date": _rand_date(datetime(2021, 1, 1), 1200),
+                "start_date": _rand_date(datetime(2023, 1, 1), 1000),
                 "term_months": random.choice([12, 24, 36, 60, 120, 240, 360]),
             })
             loan_id += 1
