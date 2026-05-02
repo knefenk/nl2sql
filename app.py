@@ -27,8 +27,7 @@ if "messages" not in st.session_state:
 def _render_result(result: dict):
     """Render agent tool calls chronologically, explain at bottom."""
     steps = result.get("steps", [])
-    sql_shown = False
-    sql_error = None
+    table_shown = False
 
     for step in steps:
         name = step["name"]
@@ -46,16 +45,15 @@ def _render_result(result: dict):
         elif name == "fallback_skill":
             st.caption(f"Classification failed, using fallback: {data}")
 
-        elif name == "tool:run_sql" and not sql_shown:
+        elif name == "tool:run_sql":
             sql = data.get("sql", "") if isinstance(data, dict) else str(data)
             st.code(sql, language="sql")
-            sql_shown = True
 
         elif name == "sql_error":
-            sql_error = str(data) if data else "Unknown SQL error."
-            st.error(f"SQL error: {sql_error}")
+            st.error(f"SQL error: {data}")
 
-        elif name == "sql_success" and isinstance(data, dict):
+        elif name == "sql_success" and not table_shown:
+            table_shown = True
             res = result.get("results")
             if res and res.get("rows"):
                 df = pd.DataFrame(res["rows"], columns=res["columns"])
@@ -74,8 +72,8 @@ def _render_result(result: dict):
     if answer and answer != "Agent could not respond within the step limit.":
         st.markdown(answer)
     elif not (result.get("results") and result["results"].get("rows")):
-        if sql_error:
-            st.error(f"Query failed after {result.get('retries', 0)} retries.")
+        if result.get("retries", 0) > 0:
+            st.error(f"Query failed after {result['retries']} retries.")
         else:
             st.info("No results found.")
 
