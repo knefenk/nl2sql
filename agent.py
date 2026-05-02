@@ -1,4 +1,4 @@
-"""Agent loop — orchestrate the NL2SQL pipeline with tool calling and self-correction."""
+"""Agent loop with tool calling, self-correction, and context management."""
 
 import json
 import re
@@ -7,7 +7,15 @@ from typing import Any
 import duckdb
 from openai import OpenAI
 
-from config import DB_PATH, LLAMA_SERVER, MAX_TRIPS, MODEL_NAME, SYSTEM_PROMPT
+from config import (
+    CTX_THRESHOLD,
+    DB_PATH,
+    LLAMA_SERVER,
+    MAX_TRIPS,
+    MODEL_NAME,
+    N_CTX,
+    SYSTEM_PROMPT,
+)
 from skills import SKILLS, schema_lookup
 from tools import TOOLS
 
@@ -16,8 +24,49 @@ def _get_client() -> OpenAI:
     return OpenAI(base_url=LLAMA_SERVER, api_key="not-needed")
 
 
+def _estimate_tokens(messages: list[dict]) -> int:
+    """Rough token estimate: 1 token per 4 characters."""
+    return sum(len(str(m.get("content", ""))) for m in messages) // 4
+
+
+def _summarize_context(messages: list[dict], client: OpenAI) -> list[dict]:
+    """
+    Compress the middle of the conversation when near context limit.
+    Keeps the system message and last 3 turns, summarizes the rest.
+    """
+    if len(messages) <= 6:
+        return messages
+
+    middle = messages[1:-4]
+    if not middle:
+        return messages
+
+    summary_input = "Summarize this agent conversation trace. Keep all SQL queries, errors, results, and corrections.\n\n"
+    for m in middle:
+        role = m.get("role", "?")
+        content = m.get("content", "") or ""
+        if m.get("tool_calls"):
+            for tc in m["tool_calls"]:
+                content = f"[tool_call: {tc['function']['name']}]"
+        summary_input += f"[{role}] {str(content)[:300]}\n"
+
+    response = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": "You compress conversation traces. Be concise."},
+            {"role": "user", "content": summary_input},
+        ],
+        temperature=0.0,
+        max_tokens=300,
+    )
+    summary = response.choices[0].message.content or ""
+
+    return [messages[0]] + [
+        {"role": "system", "content": f"Earlier trace (compressed):\n{summary}"}
+    ] + messages[-4:]
+
+
 def _parse_tool_call(response: Any) -> dict | None:
-    """Extract the first tool call from an OpenAI chat completion response."""
     if not response.choices:
         return None
     choice = response.choices[0]
@@ -32,10 +81,8 @@ def _parse_tool_call(response: Any) -> dict | None:
 
 
 def _execute_sql(sql: str) -> dict:
-    """Execute SQL against DuckDB. Returns {columns, rows, error, row_count}."""
     conn = duckdb.connect(DB_PATH)
     try:
-        # Strip any markdown backticks that the model might have emitted
         sql = re.sub(r"^```sql\s*", "", sql.strip())
         sql = re.sub(r"^```\s*", "", sql)
         sql = re.sub(r"\s*```$", "", sql)
@@ -50,7 +97,6 @@ def _execute_sql(sql: str) -> dict:
 
 
 def _format_rows(columns: list[str], rows: list) -> str:
-    """Format query results as a readable string for feeding back to the model."""
     if not rows:
         return "Query returned 0 rows."
     header = " | ".join(columns)
@@ -62,13 +108,32 @@ def _format_rows(columns: list[str], rows: list) -> str:
     return "\n".join(lines)
 
 
-def _classify_question(
-    question: str, client: OpenAI
-) -> tuple[str | None, dict | None]:
-    """
-    Ask the model to classify the question and load the appropriate skill.
-    Returns (skill_name, tool_call) or (None, error_info).
-    """
+def _add_tool_message(messages: list[dict], tc_id: str, name: str, args: dict, content: str) -> None:
+    """Append assistant tool_call + tool result to the message list."""
+    messages.append({
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": tc_id,
+            "type": "function",
+            "function": {"name": name, "arguments": json.dumps(args)},
+        }],
+    })
+    messages.append({
+        "role": "tool",
+        "tool_call_id": tc_id,
+        "content": content,
+    })
+
+
+def _maybe_compress(messages: list[dict], client: OpenAI) -> tuple[list[dict], bool]:
+    """Compress context if near limit. Returns (messages, was_compressed)."""
+    if _estimate_tokens(messages) > int(N_CTX * CTX_THRESHOLD):
+        return _summarize_context(messages, client), True
+    return messages, False
+
+
+def _classify_question(question: str, client: OpenAI) -> tuple[str | None, dict | None]:
     classify_prompt = f"""\
 Classify this question and load the most relevant skill.
 
@@ -80,14 +145,11 @@ Available skills:
 - transaction-analysis: questions about spending, categories, dates
 - account-overview: questions about account balances, types, currencies
 
-Call load_skill with the ONE most relevant skill. If the question spans
-multiple domains, pick the primary one."""
+Call load_skill with the ONE most relevant skill."""
 
     response = client.chat.completions.create(
         model=MODEL_NAME,
-        messages=[
-            {"role": "system", "content": classify_prompt},
-        ],
+        messages=[{"role": "system", "content": classify_prompt}],
         tools=TOOLS,
         temperature=0.0,
         max_tokens=200,
@@ -99,16 +161,6 @@ multiple domains, pick the primary one."""
 
 
 def run_agent(question: str, on_step=None) -> dict:
-    """
-    Run the full agent loop for a question.
-
-    Args:
-        question: Natural language question about the financial database.
-        on_step: Optional callback(step_name, data) for UI progress updates.
-
-    Returns:
-        dict with keys: answer, sql, results, retries, trips, steps
-    """
     client = _get_client()
     steps = []
     retries = 0
@@ -119,14 +171,12 @@ def run_agent(question: str, on_step=None) -> dict:
         if on_step:
             on_step(name, data)
 
-    # Step 1: Classify and load skill
     _step("classify", question)
     skill_name, tc = _classify_question(question, client)
     trips_used += 1
     _step("skill_loaded", skill_name)
 
     if skill_name is None:
-        # Model didn't call load_skill — push forward with a safe default
         skill_name = "customer-insights"
         _step("fallback_skill", skill_name)
 
@@ -141,9 +191,12 @@ def run_agent(question: str, on_step=None) -> dict:
     sql_history = []
     final_answer = None
 
-    # Step 2+: Tool loop
     while trips_used < MAX_TRIPS:
         trips_used += 1
+        messages, compressed = _maybe_compress(messages, client)
+        if compressed:
+            _step("context_compressed", True)
+
         response = client.chat.completions.create(
             model=MODEL_NAME,
             messages=messages,
@@ -154,7 +207,6 @@ def run_agent(question: str, on_step=None) -> dict:
         tc = _parse_tool_call(response)
 
         if tc is None:
-            # Model responded with text instead of a tool call — extract it
             text = response.choices[0].message.content or ""
             final_answer = text
             _step("text_response", text)
@@ -165,20 +217,7 @@ def run_agent(question: str, on_step=None) -> dict:
         if tc["name"] == "load_skill":
             skill = tc["args"].get("skill", "")
             if skill in SKILLS:
-                messages.append({
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [{
-                        "id": tc["id"],
-                        "type": "function",
-                        "function": {"name": "load_skill", "arguments": json.dumps(tc["args"])},
-                    }],
-                })
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": SKILLS[skill],
-                })
+                _add_tool_message(messages, tc["id"], "load_skill", tc["args"], SKILLS[skill])
                 _step("skill_injected", skill)
             continue
 
@@ -188,76 +227,23 @@ def run_agent(question: str, on_step=None) -> dict:
             result = _execute_sql(sql)
 
             if result["error"]:
-                # Auto-inject duckdb-rules on error if not already present
-                if "duckdb-rules" not in skill_name:
-                    messages.append({
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [{
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {"name": "run_sql", "arguments": json.dumps(tc["args"])},
-                        }],
-                    })
-                    error_content = f"Error: {result['error']}\n\n{SKILLS['duckdb-rules']}"
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": error_content,
-                    })
-                else:
-                    messages.append({
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [{
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {"name": "run_sql", "arguments": json.dumps(tc["args"])},
-                        }],
-                    })
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": f"Error: {result['error']}",
-                    })
+                rules_text = SKILLS["duckdb-rules"] if "duckdb-rules" not in str(messages[-6:]) else ""
+                error_content = f"Error: {result['error']}"
+                if rules_text:
+                    error_content += f"\n\n{rules_text}"
+                _add_tool_message(messages, tc["id"], "run_sql", tc["args"], error_content)
                 retries += 1
                 _step("sql_error", result["error"])
             else:
                 formatted = _format_rows(result["columns"], result["rows"])
-                messages.append({
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [{
-                        "id": tc["id"],
-                        "type": "function",
-                        "function": {"name": "run_sql", "arguments": json.dumps(tc["args"])},
-                    }],
-                })
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": formatted,
-                })
+                _add_tool_message(messages, tc["id"], "run_sql", tc["args"], formatted)
                 _step("sql_success", {"columns": result["columns"], "row_count": result["row_count"]})
             continue
 
         elif tc["name"] == "schema_check":
             table = tc["args"].get("table", "")
             columns = schema_lookup(table)
-            messages.append({
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{
-                    "id": tc["id"],
-                    "type": "function",
-                    "function": {"name": "schema_check", "arguments": json.dumps(tc["args"])},
-                }],
-            })
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc["id"],
-                "content": columns,
-            })
+            _add_tool_message(messages, tc["id"], "schema_check", tc["args"], columns)
             _step("schema_checked", table)
             continue
 
@@ -266,14 +252,13 @@ def run_agent(question: str, on_step=None) -> dict:
             _step("explain", final_answer)
             break
 
-    # Build return value
     last_sql = sql_history[-1] if sql_history else None
     last_result = None
     if last_sql:
         last_result = _execute_sql(last_sql)
 
     return {
-        "answer": final_answer or "Agent could not generate a response within the step limit.",
+        "answer": final_answer or "Agent could not respond within the step limit.",
         "sql": last_sql,
         "results": last_result,
         "sql_history": sql_history,
