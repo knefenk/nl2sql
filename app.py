@@ -1,12 +1,11 @@
-"""Streamlit UI for the NL2SQL agent."""
+"""Streamlit chat UI for the NL2SQL agent."""
 
 import streamlit as st
 import pandas as pd
 
 from agent import run_agent
 
-
-st.set_page_config(page_title="NL2SQL Agent", page_icon=":bar_chart:", layout="wide")
+st.set_page_config(page_title="NL2SQL Agent", layout="wide")
 
 SAMPLE_QUESTIONS = [
     "How many customers in each segment?",
@@ -21,110 +20,113 @@ SAMPLE_QUESTIONS = [
     "How many customers joined in 2024?",
 ]
 
-st.title("NL2SQL Agent")
-st.caption("DuckDB + llama-3-sqlcoder-8b agentic SQL system")
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-# Sidebar
-with st.sidebar:
-    st.header("Sample Questions")
-    for q in SAMPLE_QUESTIONS:
-        if st.button(q, key=f"sample_{q[:30]}", use_container_width=True):
-            st.session_state.question = q
 
-    st.divider()
-    st.header("About")
-    st.markdown("""
-    This agent converts natural language questions into DuckDB SQL queries
-    using the llama-3-sqlcoder-8b model running locally via llama.cpp.
+def _render_result(result: dict, key_suffix: str = ""):
+    """Render agent result: answer, SQL, table, chart, trace."""
+    answer = result.get("answer", "")
+    if answer:
+        st.markdown(answer)
 
-    **Architecture:**
-    - Skills-based domain routing
-    - Self-correcting SQL generation
-    - Schema-aware retry on column errors
-    """)
+    sql = result.get("sql")
+    if sql:
+        with st.expander("SQL", expanded=False):
+            st.code(sql, language="sql")
 
-# Main
-question = st.text_input(
-    "Ask a question about the financial database",
-    placeholder="e.g., Top 5 customers by loan balance",
-    key="question_input",
-    label_visibility="collapsed",
-)
-
-if "question" in st.session_state and question == "":
-    question = st.session_state.pop("question")
-
-if question.strip():
-    with st.spinner("Agent is working..."):
-        steps_placeholder = st.empty()
-        result = run_agent(question)
-
-    # Show agent workflow
-    with st.expander("Agent Workflow", expanded=False):
-        for step in result["steps"]:
-            st.text(f"[{step['name']}] {step.get('data', '')}")
-
-    # Show SQL
-    if result["sql"]:
-        with st.expander("Generated SQL", expanded=True):
-            st.code(result["sql"], language="sql")
-
-    # Show results or error
-    res = result["results"]
-    if res and res["error"]:
-        st.error(f"SQL Error: {res['error']}")
-        if result.get("retries", 0) > 0:
-            st.info(f"Agent retried {result['retries']} time(s). Check workflow for details.")
-    elif res and res["rows"]:
+    res = result.get("results")
+    if res and res.get("rows"):
         df = pd.DataFrame(res["rows"], columns=res["columns"])
-        st.subheader(f"Results ({len(df)} rows)")
         st.dataframe(df, use_container_width=True, hide_index=True)
 
         numeric_cols = df.select_dtypes(include=["float64", "int64"]).columns.tolist()
         if numeric_cols and len(df) <= 50:
             with st.expander("Chart", expanded=False):
-                chart_type = st.radio(
-                    "Type", ["Bar", "Line", "Area"],
-                    horizontal=True,
-                    key=f"chart_{hash(question)}",
-                )
                 non_num = [c for c in df.columns if c not in numeric_cols]
                 x_default = non_num[0] if non_num else df.columns[0]
                 y_default = numeric_cols[0]
                 x_col = st.selectbox(
                     "X-axis", df.columns.tolist(),
                     index=df.columns.tolist().index(x_default),
-                    key=f"x_{hash(question)}",
+                    key=f"x_{key_suffix}",
                 )
                 y_col = st.selectbox(
                     "Y-axis", numeric_cols,
                     index=numeric_cols.index(y_default),
-                    key=f"y_{hash(question)}",
+                    key=f"y_{key_suffix}",
                 )
                 try:
-                    chart_df = df.set_index(x_col)[y_col]
-                    if chart_type == "Bar":
-                        st.bar_chart(chart_df)
-                    elif chart_type == "Line":
-                        st.line_chart(chart_df)
-                    else:
-                        st.area_chart(chart_df)
+                    st.bar_chart(df.set_index(x_col)[y_col])
                 except Exception:
                     st.caption("Chart not applicable for this result shape")
 
         csv = df.to_csv(index=False)
-        st.download_button("Download CSV", csv, "results.csv", "text/csv")
-    elif res:
-        st.info("No results found for this query.")
-    else:
-        if result.get("answer"):
-            st.info(result["answer"])
-        else:
-            st.warning("Agent did not produce a SQL query or response.")
+        st.download_button("Download CSV", csv, "results.csv", "text/csv", key=f"dl_{key_suffix}")
 
-    # Footer stats
-    st.caption(
-        f"Skill: {result.get('skill_used', 'unknown')} | "
-        f"Trips: {result.get('trips', 0)}/{5} | "
-        f"Retries: {result.get('retries', 0)}"
+    elif res and res.get("error"):
+        st.error(f"SQL Error: {res['error']}")
+    elif not answer:
+        st.info("No results found.")
+
+    with st.expander(f"Trace ({result.get('trips', '?')} trips, {result.get('retries', 0)} retries)", expanded=False):
+        for s in result.get("steps", []):
+            st.text(f"[{s['name']}] {s.get('data', '')}")
+
+
+def _handle_query(question: str) -> dict:
+    """Run the agent and render the result. Returns the result dict."""
+    with st.spinner(""):
+        result = run_agent(question)
+    _render_result(result, key_suffix=str(hash(question)))
+    return result
+
+
+# --- Sidebar ---
+with st.sidebar:
+    st.header("Sample Questions")
+    for q in SAMPLE_QUESTIONS:
+        if st.button(q, key=f"sample_{q[:30]}", use_container_width=True):
+            st.session_state.pending_question = q
+            st.rerun()
+
+    st.divider()
+    st.header("About")
+    st.markdown(
+        "NL2SQL agent powered by Hermes-2-Pro 8B running locally via llama.cpp. "
+        "Uses domain skill cards, self-correcting SQL generation, and schema-aware retry."
     )
+
+# --- Header ---
+st.title("NL2SQL Agent")
+st.caption("Ask questions about the financial database in plain English.")
+
+# --- Chat history ---
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        if msg["role"] == "assistant":
+            _render_result(msg["data"], key_suffix=f"hist_{hash(msg['content'])}")
+        else:
+            st.markdown(msg["content"])
+
+# --- Chat input ---
+if question := st.chat_input("Ask a question about the financial database..."):
+    st.session_state.messages.append({"role": "user", "content": question})
+    with st.chat_message("user"):
+        st.markdown(question)
+
+    with st.chat_message("assistant"):
+        result = _handle_query(question)
+    st.session_state.messages.append({"role": "assistant", "content": question, "data": result})
+    st.rerun()
+
+# --- Sample question click ---
+if "pending_question" in st.session_state:
+    q = st.session_state.pop("pending_question")
+    st.session_state.messages.append({"role": "user", "content": q})
+    with st.chat_message("user"):
+        st.markdown(q)
+    with st.chat_message("assistant"):
+        result = _handle_query(q)
+    st.session_state.messages.append({"role": "assistant", "content": q, "data": result})
+    st.rerun()
