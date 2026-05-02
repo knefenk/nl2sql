@@ -1,4 +1,4 @@
-"""Agent loop with tool calling, self-correction, and context management."""
+"""Agent loop using Hermes-2-Pro native <tool_call> format."""
 
 import json
 import re
@@ -17,7 +17,11 @@ from config import (
     SYSTEM_PROMPT,
 )
 from skills import SKILLS, schema_lookup
-from tools import TOOLS
+
+
+TOOL_CALL_RE = re.compile(
+    r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL
+)
 
 
 def _get_client() -> OpenAI:
@@ -25,15 +29,10 @@ def _get_client() -> OpenAI:
 
 
 def _estimate_tokens(messages: list[dict]) -> int:
-    """Rough token estimate: 1 token per 4 characters."""
     return sum(len(str(m.get("content", ""))) for m in messages) // 4
 
 
 def _summarize_context(messages: list[dict], client: OpenAI) -> list[dict]:
-    """
-    Compress the middle of the conversation when near context limit.
-    Keeps the system message and last 3 turns, summarizes the rest.
-    """
     if len(messages) <= 6:
         return messages
 
@@ -41,20 +40,17 @@ def _summarize_context(messages: list[dict], client: OpenAI) -> list[dict]:
     if not middle:
         return messages
 
-    summary_input = "Summarize this agent conversation trace. Keep all SQL queries, errors, results, and corrections.\n\n"
+    trace = ""
     for m in middle:
         role = m.get("role", "?")
-        content = m.get("content", "") or ""
-        if m.get("tool_calls"):
-            for tc in m["tool_calls"]:
-                content = f"[tool_call: {tc['function']['name']}]"
-        summary_input += f"[{role}] {str(content)[:300]}\n"
+        content = str(m.get("content", ""))[:400]
+        trace += f"[{role}] {content}\n"
 
     response = client.chat.completions.create(
         model=MODEL_NAME,
         messages=[
-            {"role": "system", "content": "You compress conversation traces. Be concise."},
-            {"role": "user", "content": summary_input},
+            {"role": "system", "content": "Compress this agent trace. Keep SQL queries, errors, and results. Be concise."},
+            {"role": "user", "content": trace},
         ],
         temperature=0.0,
         max_tokens=300,
@@ -66,18 +62,26 @@ def _summarize_context(messages: list[dict], client: OpenAI) -> list[dict]:
     ] + messages[-4:]
 
 
-def _parse_tool_call(response: Any) -> dict | None:
-    if not response.choices:
+def _maybe_compress(messages: list[dict], client: OpenAI) -> tuple[list[dict], bool]:
+    if _estimate_tokens(messages) > int(N_CTX * CTX_THRESHOLD):
+        return _summarize_context(messages, client), True
+    return messages, False
+
+
+def _parse_tool_call(text: str) -> dict | None:
+    """Parse <tool_call>{"name": "...", "arguments": {...}}</tool_call> from text."""
+    match = TOOL_CALL_RE.search(text)
+    if not match:
         return None
-    choice = response.choices[0]
-    if not choice.message.tool_calls:
-        return None
-    tc = choice.message.tool_calls[0]
     try:
-        args = json.loads(tc.function.arguments)
+        data = json.loads(match.group(1).strip())
     except json.JSONDecodeError:
         return None
-    return {"id": tc.id, "name": tc.function.name, "args": args}
+    name = data.get("name", "")
+    args = data.get("arguments", {})
+    if not name:
+        return None
+    return {"name": name, "args": args}
 
 
 def _execute_sql(sql: str) -> dict:
@@ -108,56 +112,41 @@ def _format_rows(columns: list[str], rows: list) -> str:
     return "\n".join(lines)
 
 
-def _add_tool_message(messages: list[dict], tc_id: str, name: str, args: dict, content: str) -> None:
-    """Append assistant tool_call + tool result to the message list."""
-    messages.append({
-        "role": "assistant",
-        "content": None,
-        "tool_calls": [{
-            "id": tc_id,
-            "type": "function",
-            "function": {"name": name, "arguments": json.dumps(args)},
-        }],
-    })
-    messages.append({
-        "role": "tool",
-        "tool_call_id": tc_id,
-        "content": content,
-    })
-
-
-def _maybe_compress(messages: list[dict], client: OpenAI) -> tuple[list[dict], bool]:
-    """Compress context if near limit. Returns (messages, was_compressed)."""
-    if _estimate_tokens(messages) > int(N_CTX * CTX_THRESHOLD):
-        return _summarize_context(messages, client), True
-    return messages, False
-
-
-def _classify_question(question: str, client: OpenAI) -> tuple[str | None, dict | None]:
+def _classify_question(question: str, client: OpenAI) -> tuple[str | None, Any]:
     classify_prompt = f"""\
-Classify this question and load the most relevant skill.
+You are a classifier. Respond ONLY with a tool call.
 
 Question: {question}
 
-Available skills:
-- loan-analysis: questions about loans, interest rates, remaining balances
-- customer-insights: questions about customers, segments, demographics
-- transaction-analysis: questions about spending, categories, dates
-- account-overview: questions about account balances, types, currencies
+Functions:
+- load_skill(skill: "loan-analysis" | "customer-insights" | "transaction-analysis" | "account-overview")
 
-Call load_skill with the ONE most relevant skill."""
+Pick the ONE most relevant skill. Respond with the function call."""
 
     response = client.chat.completions.create(
         model=MODEL_NAME,
         messages=[{"role": "system", "content": classify_prompt}],
-        tools=TOOLS,
         temperature=0.0,
         max_tokens=200,
     )
-    tc = _parse_tool_call(response)
+    text = response.choices[0].message.content or ""
+    tc = _parse_tool_call(text)
     if tc and tc["name"] == "load_skill":
         return tc["args"].get("skill"), tc
-    return None, tc
+    # Fallback: try to extract skill name from raw text
+    skill_match = re.search(r"loan-analysis|customer-insights|transaction-analysis|account-overview", text)
+    if skill_match:
+        return skill_match.group(0), None
+    return None, None
+
+
+def _append_assistant(messages: list[dict], content: str) -> None:
+    messages.append({"role": "assistant", "content": content})
+
+
+def _feed_tool_response(messages: list[dict], content: str) -> None:
+    """Feed a tool response back to the model in Hermes native format."""
+    messages.append({"role": "user", "content": f"<tool_response>\n{content}\n</tool_response>"})
 
 
 def run_agent(question: str, on_step=None) -> dict:
@@ -172,7 +161,7 @@ def run_agent(question: str, on_step=None) -> dict:
             on_step(name, data)
 
     _step("classify", question)
-    skill_name, tc = _classify_question(question, client)
+    skill_name, _ = _classify_question(question, client)
     trips_used += 1
     _step("skill_loaded", skill_name)
 
@@ -181,10 +170,10 @@ def run_agent(question: str, on_step=None) -> dict:
         _step("fallback_skill", skill_name)
 
     skill_text = SKILLS.get(skill_name, SKILLS["customer-insights"])
-    system_prompt = SYSTEM_PROMPT + "\n\n" + skill_text + "\n\n" + SKILLS["duckdb-rules"]
+    full_system = SYSTEM_PROMPT + "\n\n" + skill_text + "\n\n" + SKILLS["duckdb-rules"]
 
     messages = [
-        {"role": "system", "content": system_prompt},
+        {"role": "system", "content": full_system},
         {"role": "user", "content": question},
     ]
 
@@ -200,16 +189,22 @@ def run_agent(question: str, on_step=None) -> dict:
         response = client.chat.completions.create(
             model=MODEL_NAME,
             messages=messages,
-            tools=TOOLS,
             temperature=0.0,
             max_tokens=800,
         )
-        tc = _parse_tool_call(response)
+        text = response.choices[0].message.content or ""
+        _append_assistant(messages, text)
+
+        tc = _parse_tool_call(text)
 
         if tc is None:
-            text = response.choices[0].message.content or ""
-            final_answer = text
-            _step("text_response", text)
+            # No tool call found — check if this is a plain text answer
+            if text.strip():
+                final_answer = text.strip()
+                _step("text_response", final_answer)
+            else:
+                final_answer = "Agent produced no output."
+                _step("empty_response", None)
             break
 
         _step(f"tool:{tc['name']}", tc["args"])
@@ -217,7 +212,7 @@ def run_agent(question: str, on_step=None) -> dict:
         if tc["name"] == "load_skill":
             skill = tc["args"].get("skill", "")
             if skill in SKILLS:
-                _add_tool_message(messages, tc["id"], "load_skill", tc["args"], SKILLS[skill])
+                _feed_tool_response(messages, SKILLS[skill])
                 _step("skill_injected", skill)
             continue
 
@@ -227,23 +222,22 @@ def run_agent(question: str, on_step=None) -> dict:
             result = _execute_sql(sql)
 
             if result["error"]:
-                rules_text = SKILLS["duckdb-rules"] if "duckdb-rules" not in str(messages[-6:]) else ""
-                error_content = f"Error: {result['error']}"
-                if rules_text:
-                    error_content += f"\n\n{rules_text}"
-                _add_tool_message(messages, tc["id"], "run_sql", tc["args"], error_content)
+                content = f"Error: {result['error']}"
+                if "duckdb-rules" not in str(messages[-6:]):
+                    content += f"\n\n{SKILLS['duckdb-rules']}"
+                _feed_tool_response(messages, content)
                 retries += 1
                 _step("sql_error", result["error"])
             else:
                 formatted = _format_rows(result["columns"], result["rows"])
-                _add_tool_message(messages, tc["id"], "run_sql", tc["args"], formatted)
+                _feed_tool_response(messages, formatted)
                 _step("sql_success", {"columns": result["columns"], "row_count": result["row_count"]})
             continue
 
         elif tc["name"] == "schema_check":
             table = tc["args"].get("table", "")
             columns = schema_lookup(table)
-            _add_tool_message(messages, tc["id"], "schema_check", tc["args"], columns)
+            _feed_tool_response(messages, columns)
             _step("schema_checked", table)
             continue
 
