@@ -23,9 +23,9 @@ TOOL_CALL_RE = re.compile(
     r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL
 )
 
-# Also accept bare JSON: {"name": "...", "arguments": {...}}
-BARE_TOOL_RE = re.compile(
-    r'\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"arguments"\s*:\s*\{[^}]+\}\s*\}', re.DOTALL
+# Match balanced { ... } blocks for bare JSON tool calls
+BRACE_BLOCK_RE = re.compile(
+    r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", re.DOTALL
 )
 
 
@@ -74,28 +74,27 @@ def _maybe_compress(messages: list[dict], client: OpenAI) -> tuple[list[dict], b
 
 
 def _parse_tool_call(text: str) -> dict | None:
-    """Parse tool call from text. Accepts both <tool_call> wrapper and bare JSON."""
+    """Parse tool call from text. Accepts <tool_call> wrapper or bare JSON object."""
     # Try <tool_call> wrapper first
     match = TOOL_CALL_RE.search(text)
     if match:
         try:
             data = json.loads(match.group(1).strip())
+            if "name" in data:
+                return {"name": data["name"], "args": data.get("arguments", {})}
         except json.JSONDecodeError:
-            return None
-    else:
-        # Try bare JSON: {"name": "...", "arguments": {...}}
-        match = BARE_TOOL_RE.search(text)
-        if not match:
-            return None
+            pass
+
+    # Try parsing any {...} block as a tool call JSON
+    for block in BRACE_BLOCK_RE.findall(text):
         try:
-            data = json.loads(match.group(0).strip())
+            data = json.loads(block.strip())
+            if "name" in data and "arguments" in data:
+                return {"name": data["name"], "args": data["arguments"]}
         except json.JSONDecodeError:
-            return None
-    name = data.get("name", "")
-    args = data.get("arguments", {})
-    if not name:
-        return None
-    return {"name": name, "args": args}
+            continue
+
+    return None
 
 
 def _execute_sql(sql: str) -> dict:
