@@ -105,9 +105,19 @@ def _execute_sql(sql: str) -> dict:
         sql = re.sub(r"\s*```$", "", sql)
         result = conn.execute(sql)
         columns = [desc[0] for desc in result.description]
+        # Deduplicate columns from JOINs (e.g., SELECT * produces duplicate customer_id)
+        seen = {}
+        deduped = []
+        for c in columns:
+            if c in seen:
+                seen[c] += 1
+                deduped.append(f"{c}_{seen[c]}")
+            else:
+                seen[c] = 0
+                deduped.append(c)
         rows = result.fetchall()
         conn.close()
-        return {"columns": columns, "rows": rows, "error": None, "row_count": len(rows)}
+        return {"columns": deduped, "rows": rows, "error": None, "row_count": len(rows)}
     except Exception as e:
         conn.close()
         return {"columns": [], "rows": [], "error": str(e), "row_count": 0}
