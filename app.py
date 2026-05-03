@@ -93,10 +93,17 @@ def _handle_query(question: str) -> dict:
         result = run_agent(question, context_history=st.session_state.qa_history[-5:])
     _render_result(result)
 
-    # Record Q&A for multi-turn context (questions + explain outputs only)
+    # Record Q&A for multi-turn context (questions + sql + explain outputs)
+    # Skip entries with SQL errors — those answers are likely wrong
     answer = result.get("answer", "")
-    if answer and answer != "Agent could not respond within the step limit.":
-        st.session_state.qa_history.append({"question": question, "answer": answer})
+    sql = result.get("sql", "")
+    retries = result.get("retries", 0)
+    if answer and answer != "Agent could not respond within the step limit." and retries == 0 and sql:
+        st.session_state.qa_history.append({
+            "question": question,
+            "answer": answer,
+            "sql": sql,
+        })
 
     return result
 

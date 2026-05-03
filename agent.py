@@ -199,14 +199,16 @@ def run_agent(question: str, on_step=None, context_history: list[dict] | None = 
         {"role": "system", "content": full_system},
     ]
 
-    # Inject previous Q&A pairs as multi-turn context (questions + explain outputs only)
+    # Inject previous Q&A pairs as multi-turn context (questions + sql + explain outputs)
+    # Injected as "user" role so the system prompt's tool-calling mandate stays authoritative
     if context_history:
         history_block = "Previous conversation:\n"
         for i, entry in enumerate(context_history, 1):
             history_block += f"\n[Q{i}] {entry['question']}\n"
+            history_block += f"[SQL{i}] {entry['sql']}\n"
             history_block += f"[A{i}] {entry['answer']}\n"
-        history_block += "\n(Use the above Q&A context to resolve follow-up references like 'them', 'it', 'those', etc.)"
-        messages.append({"role": "system", "content": history_block})
+        history_block += "\n(Use the above Q&A context to resolve follow-up references like 'them', 'it', 'those'. Reuse SQL WHERE clauses from previous queries when composing new ones.)"
+        messages.append({"role": "user", "content": history_block})
 
     messages.append({"role": "user", "content": question})
 
