@@ -172,7 +172,7 @@ def _feed_tool_response(messages: list[dict], content: str) -> None:
     messages.append({"role": "user", "content": f"<tool_response>\n{content}\n</tool_response>"})
 
 
-def run_agent(question: str, on_step=None) -> dict:
+def run_agent(question: str, on_step=None, context_history: list[dict] | None = None) -> dict:
     client = _get_client()
     steps = []
     retries = 0
@@ -197,8 +197,18 @@ def run_agent(question: str, on_step=None) -> dict:
 
     messages = [
         {"role": "system", "content": full_system},
-        {"role": "user", "content": question},
     ]
+
+    # Inject previous Q&A pairs as multi-turn context (questions + explain outputs only)
+    if context_history:
+        history_block = "Previous conversation:\n"
+        for i, entry in enumerate(context_history, 1):
+            history_block += f"\n[Q{i}] {entry['question']}\n"
+            history_block += f"[A{i}] {entry['answer']}\n"
+        history_block += "\n(Use the above Q&A context to resolve follow-up references like 'them', 'it', 'those', etc.)"
+        messages.append({"role": "system", "content": history_block})
+
+    messages.append({"role": "user", "content": question})
 
     sql_history = []
     final_answer = None

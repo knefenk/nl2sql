@@ -23,6 +23,9 @@ SAMPLE_QUESTIONS = [
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
+if "qa_history" not in st.session_state:
+    st.session_state.qa_history = []
+
 
 def _render_result(result: dict):
     """Render agent tool calls chronologically, explain at bottom."""
@@ -87,8 +90,14 @@ def _render_result(result: dict):
 
 def _handle_query(question: str) -> dict:
     with st.spinner(""):
-        result = run_agent(question)
+        result = run_agent(question, context_history=st.session_state.qa_history[-5:])
     _render_result(result)
+
+    # Record Q&A for multi-turn context (questions + explain outputs only)
+    answer = result.get("answer", "")
+    if answer and answer != "Agent could not respond within the step limit.":
+        st.session_state.qa_history.append({"question": question, "answer": answer})
+
     return result
 
 
@@ -99,6 +108,13 @@ with st.sidebar:
         if st.button(q, key=f"sample_{q[:30]}", use_container_width=True):
             st.session_state.pending_question = q
             st.rerun()
+
+    st.divider()
+    st.header("Context")
+    if st.button("Clear conversation context", use_container_width=True):
+        st.session_state.qa_history = []
+        st.rerun()
+    st.caption(f"{len(st.session_state.qa_history)} previous Q&A pairs stored")
 
     st.divider()
     st.header("About")
