@@ -1,4 +1,8 @@
-"""Agent loop using Hermes-2-Pro native <tool_call> format."""
+"""Agent loop using text-based tool-calling (<tool_call>/<tool_response> format).
+
+Model-agnostic: works with any model that can follow format instructions.
+Tested with Hermes-2-Pro 8B and Qwen 3.5 9B.
+"""
 
 import json
 import re
@@ -27,6 +31,33 @@ TOOL_CALL_RE = re.compile(
 BRACE_BLOCK_RE = re.compile(
     r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", re.DOTALL
 )
+
+# Match <!-- THINKING -->...<!-- ANSWER --> reasoning wrapper (evaluation prompt format)
+THINKING_BLOCK_RE = re.compile(
+    r"<!--\s*THINKING\s*-->.*?<!--\s*ANSWER\s*-->", re.DOTALL
+)
+
+# Match <think>...</think> reasoning tags (Qwen native chat template format)
+QWEN_THINK_RE = re.compile(
+    r"<think>.*?</think>", re.DOTALL
+)
+
+# Match JSON array [...] for tool-call array format
+JSON_ARRAY_RE = re.compile(
+    r"\[\s*\{.*?\}\s*\]", re.DOTALL
+)
+
+
+def _strip_thinking(text: str) -> str:
+    """Strip reasoning/thinking blocks from model output.
+
+    Handles two formats:
+    - <!-- THINKING -->...<!-- ANSWER -->  (evaluation prompt)
+    - <think>...</think>                   (Qwen native chat template)
+    """
+    text = THINKING_BLOCK_RE.sub("", text)
+    text = QWEN_THINK_RE.sub("", text)
+    return text.strip()
 
 
 def _get_client() -> OpenAI:
@@ -74,23 +105,52 @@ def _maybe_compress(messages: list[dict], client: OpenAI) -> tuple[list[dict], b
 
 
 def _parse_tool_call(text: str) -> dict | None:
-    """Parse tool call from text. Accepts <tool_call> wrapper or bare JSON object."""
-    # Try <tool_call> wrapper first
+    """Parse tool call from model output. Format-agnostic — handles:
+
+    1. <tool_call>{"name":..., "arguments":...}</tool_call>  (Hermes native)
+    2. {"name":..., "arguments":...}                          (bare JSON object)
+    3. [{"tool":..., "args":...}]                            (Qwen/DeepSeek array)
+    4. <!-- THINKING -->...<!-- ANSWER -->[...]               (reasoning wrapper)
+
+    All normalized to {"name": str, "args": dict}.
+    """
+    # Strip reasoning wrapper if present (Qwen3.5-DeepSeek-V4-Flash)
+    text = _strip_thinking(text)
+
+    # --- Strategy 1: <tool_call> wrapper (Hermes native) ---
     match = TOOL_CALL_RE.search(text)
     if match:
         try:
             data = json.loads(match.group(1).strip())
-            if "name" in data:
-                return {"name": data["name"], "args": data.get("arguments", {})}
+            tool_name = data.get("tool") or data.get("name")
+            tool_args = data.get("args") or data.get("arguments", {})
+            if tool_name:
+                return {"name": tool_name, "args": tool_args}
         except json.JSONDecodeError:
             pass
 
-    # Try parsing any {...} block as a tool call JSON
+    # --- Strategy 2: JSON array [{...}] (Qwen/DeepSeek eval format) ---
+    arr_match = JSON_ARRAY_RE.search(text)
+    if arr_match:
+        try:
+            arr = json.loads(arr_match.group(0))
+            if isinstance(arr, list) and len(arr) > 0:
+                item = arr[0]
+                tool_name = item.get("tool") or item.get("name")
+                tool_args = item.get("args") or item.get("arguments", {})
+                if tool_name:
+                    return {"name": tool_name, "args": tool_args}
+        except json.JSONDecodeError:
+            pass
+
+    # --- Strategy 3: bare JSON object {"name":..., "arguments":...} ---
     for block in BRACE_BLOCK_RE.findall(text):
         try:
             data = json.loads(block.strip())
-            if "name" in data and "arguments" in data:
-                return {"name": data["name"], "args": data["arguments"]}
+            tool_name = data.get("tool") or data.get("name")
+            tool_args = data.get("args") or data.get("arguments", {})
+            if tool_name:
+                return {"name": tool_name, "args": tool_args}
         except json.JSONDecodeError:
             continue
 
@@ -150,7 +210,7 @@ Pick the ONE most relevant skill. Respond with the function call."""
         model=MODEL_NAME,
         messages=[{"role": "system", "content": classify_prompt}],
         temperature=0.0,
-        max_tokens=200,
+        max_tokens=300,   # Increased — reasoning model may output thinking first
     )
     text = response.choices[0].message.content or ""
     tc = _parse_tool_call(text)
@@ -225,7 +285,7 @@ def run_agent(question: str, on_step=None, context_history: list[dict] | None = 
             model=MODEL_NAME,
             messages=messages,
             temperature=0.0,
-            max_tokens=800,
+            max_tokens=1500,   # Increased from 800 — model may output reasoning first
         )
         text = response.choices[0].message.content or ""
         _append_assistant(messages, text)
