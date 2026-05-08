@@ -105,6 +105,27 @@ TOOLS = [
 
 # --- Helpers ---
 
+def _summarize_results(results: dict | None) -> str:
+    """Produce a compact summary of query results for multi-turn context.
+
+    Returns a string like '16 rows, e.g.: KL (12), Penang (8)' or '3 rows'.
+    """
+    if not results or not results.get("rows"):
+        return "0 rows"
+    rows = results["rows"]
+    cols = results.get("columns", [])
+    count = results.get("row_count", len(rows))
+    summary = f"{count} row{'s' if count != 1 else ''}"
+    # Show a few example values for context (up to 3 rows, first 3 columns)
+    if count > 0 and cols:
+        examples = []
+        for row in rows[:3]:
+            vals = [str(v) for v in row[:3]]
+            examples.append("(" + ", ".join(vals) + ")")
+        summary += ", e.g.: " + " ".join(examples)
+    return summary
+
+
 def _get_client() -> OpenAI:
     return OpenAI(base_url=LLAMA_SERVER, api_key="not-needed")
 
@@ -227,11 +248,16 @@ def run_agent(
 
     # Inject previous Q&A pairs for multi-turn follow-up resolution
     if context_history:
-        history_block = "Previous conversation:\n"
+        history_block = "Previous conversation (for context — resolve references like 'them', 'it', 'those'):\n"
         for i, entry in enumerate(context_history, 1):
             history_block += f"\n[Q{i}] {entry['question']}\n"
-            history_block += f"[SQL{i}] {entry.get('sql', '')}\n"
-            history_block += f"[A{i}] {entry.get('answer', '')}\n"
+            skill = entry.get("skill", "")
+            if skill:
+                history_block += f"[Skill] {skill}\n"
+            results_summary = entry.get("results_summary", "")
+            if results_summary:
+                history_block += f"[Results] {results_summary}\n"
+            history_block += f"[A{i}] {entry['answer']}\n"
         history_block += (
             "\n(Use the above to resolve references like 'them', 'it', 'those'."
             " Reuse SQL WHERE clauses from previous queries when composing new ones.)"

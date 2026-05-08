@@ -3,7 +3,7 @@
 import streamlit as st
 import pandas as pd
 
-from agent import run_agent
+from agent import run_agent, _summarize_results
 
 st.set_page_config(page_title="NL2SQL Agent", layout="wide")
 
@@ -87,10 +87,10 @@ def _render_result(result: dict):
 
 def _handle_query(question: str) -> dict:
     with st.spinner(""):
-        result = run_agent(question, context_history=st.session_state.qa_history[-5:])
+        result = run_agent(question, context_history=st.session_state.qa_history[-10:])
     _render_result(result)
 
-    # Record Q&A for multi-turn context (questions + sql + explain outputs)
+    # Record Q&A for multi-turn context
     # Skip entries with SQL errors — those answers are likely wrong
     answer = result.get("answer", "")
     sql = result.get("sql", "")
@@ -99,7 +99,8 @@ def _handle_query(question: str) -> dict:
         st.session_state.qa_history.append({
             "question": question,
             "answer": answer,
-            "sql": sql,
+            "skill": result.get("skill_used", ""),
+            "results_summary": _summarize_results(result.get("results")),
         })
 
     return result
