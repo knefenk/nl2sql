@@ -36,17 +36,14 @@ def _render_result(result: dict):
         name = step["name"]
         data = step.get("data")
 
-        if name == "skill_loaded":
-            skill = data or "unknown"
+        if name == "tool:load_skill":
+            skill = data.get("skill", "unknown") if isinstance(data, dict) else str(data)
             with st.expander(f"load_skill: {skill}", expanded=False):
                 from skills import SKILLS
                 content = SKILLS.get(skill, "Skill not found.")
                 st.text(content[:1500])
                 if len(content) > 1500:
                     st.caption("(truncated)")
-
-        elif name == "fallback_skill":
-            st.caption(f"Classification failed, using fallback: {data}")
 
         elif name == "tool:run_sql":
             sql = data.get("sql", "") if isinstance(data, dict) else str(data)
@@ -126,8 +123,8 @@ with st.sidebar:
     st.divider()
     st.header("About")
     st.markdown(
-        "NL2SQL agent powered by Hermes-2-Pro 8B running locally via llama.cpp. "
-        "Uses domain skill cards, self-correcting SQL generation, and schema-aware retry."
+        "NL2SQL agent powered by Qwen3.5-9B (DeepSeek V4 distilled) running locally via llama.cpp. "
+        "Uses native function calling, domain skill cards, self-correcting SQL, and schema-aware retry."
     )
 
 # --- Header ---

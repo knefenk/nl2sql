@@ -1,11 +1,11 @@
-"""Agent loop using text-based tool-calling (<tool_call>/<tool_response> format).
+"""Agent loop using native OpenAI function-calling (tools API).
 
-Model-agnostic: works with any model that can follow format instructions.
-Tested with Hermes-2-Pro 8B and Qwen 3.5 9B.
+Designed for Qwen3.5-9B-DeepSeek-V4-Flash via llama.cpp server.
+The server's chat template handles all tool-call formatting natively.
+No regex parsing, no format guessing, no thinking-stripping needed.
 """
 
 import json
-import re
 from typing import Any
 
 import duckdb
@@ -23,151 +23,106 @@ from config import (
 from skills import SKILLS, schema_lookup
 
 
-TOOL_CALL_RE = re.compile(
-    r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL
-)
+# --- Tool Definitions (OpenAI function-calling format) ---
 
-# Match balanced { ... } blocks for bare JSON tool calls
-BRACE_BLOCK_RE = re.compile(
-    r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", re.DOTALL
-)
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "load_skill",
+            "description": "Load a domain skill card with table schemas and example queries. Always call this first so you know the available tables and columns before writing SQL.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "skill": {
+                        "type": "string",
+                        "enum": [
+                            "loan-analysis",
+                            "customer-insights",
+                            "transaction-analysis",
+                            "account-overview",
+                        ],
+                        "description": "Domain skill to load",
+                    }
+                },
+                "required": ["skill"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_sql",
+            "description": "Execute a DuckDB SQL query against the financial database. Returns formatted rows or an error message.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sql": {
+                        "type": "string",
+                        "description": "DuckDB SQL query to execute",
+                    }
+                },
+                "required": ["sql"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "schema_check",
+            "description": "Look up the columns and types of a specific table. Use when run_sql returns an error to verify column names exist.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "table": {
+                        "type": "string",
+                        "description": "Table name to inspect (customers, accounts, transactions, or loans)",
+                    }
+                },
+                "required": ["table"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "explain",
+            "description": "Present the final answer to the user in natural language. Call this as the LAST step — the conversation ends after this call.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Natural language summary of the query results",
+                    }
+                },
+                "required": ["text"],
+            },
+        },
+    },
+]
 
-# Match <!-- THINKING -->...<!-- ANSWER --> reasoning wrapper (evaluation prompt format)
-THINKING_BLOCK_RE = re.compile(
-    r"<!--\s*THINKING\s*-->.*?<!--\s*ANSWER\s*-->", re.DOTALL
-)
 
-# Match <think>...</think> reasoning tags (Qwen native chat template format)
-QWEN_THINK_RE = re.compile(
-    r"<think>.*?</think>", re.DOTALL
-)
-
-# Match JSON array [...] for tool-call array format
-JSON_ARRAY_RE = re.compile(
-    r"\[\s*\{.*?\}\s*\]", re.DOTALL
-)
-
-
-def _strip_thinking(text: str) -> str:
-    """Strip reasoning/thinking blocks from model output.
-
-    Handles two formats:
-    - <!-- THINKING -->...<!-- ANSWER -->  (evaluation prompt)
-    - <think>...</think>                   (Qwen native chat template)
-    """
-    text = THINKING_BLOCK_RE.sub("", text)
-    text = QWEN_THINK_RE.sub("", text)
-    return text.strip()
-
+# --- Helpers ---
 
 def _get_client() -> OpenAI:
     return OpenAI(base_url=LLAMA_SERVER, api_key="not-needed")
 
 
-def _estimate_tokens(messages: list[dict]) -> int:
-    return sum(len(str(m.get("content", ""))) for m in messages) // 4
-
-
-def _summarize_context(messages: list[dict], client: OpenAI) -> list[dict]:
-    if len(messages) <= 6:
-        return messages
-
-    middle = messages[1:-4]
-    if not middle:
-        return messages
-
-    trace = ""
-    for m in middle:
-        role = m.get("role", "?")
-        content = str(m.get("content", ""))[:400]
-        trace += f"[{role}] {content}\n"
-
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
-            {"role": "system", "content": "Compress this agent trace. Keep SQL queries, errors, and results. Be concise."},
-            {"role": "user", "content": trace},
-        ],
-        temperature=0.0,
-        max_tokens=300,
-    )
-    summary = response.choices[0].message.content or ""
-
-    return [messages[0]] + [
-        {"role": "system", "content": f"Earlier trace (compressed):\n{summary}"}
-    ] + messages[-4:]
-
-
-def _maybe_compress(messages: list[dict], client: OpenAI) -> tuple[list[dict], bool]:
-    if _estimate_tokens(messages) > int(N_CTX * CTX_THRESHOLD):
-        return _summarize_context(messages, client), True
-    return messages, False
-
-
-def _parse_tool_call(text: str) -> dict | None:
-    """Parse tool call from model output. Format-agnostic — handles:
-
-    1. <tool_call>{"name":..., "arguments":...}</tool_call>  (Hermes native)
-    2. {"name":..., "arguments":...}                          (bare JSON object)
-    3. [{"tool":..., "args":...}]                            (Qwen/DeepSeek array)
-    4. <!-- THINKING -->...<!-- ANSWER -->[...]               (reasoning wrapper)
-
-    All normalized to {"name": str, "args": dict}.
-    """
-    # Strip reasoning wrapper if present (Qwen3.5-DeepSeek-V4-Flash)
-    text = _strip_thinking(text)
-
-    # --- Strategy 1: <tool_call> wrapper (Hermes native) ---
-    match = TOOL_CALL_RE.search(text)
-    if match:
-        try:
-            data = json.loads(match.group(1).strip())
-            tool_name = data.get("tool") or data.get("name")
-            tool_args = data.get("args") or data.get("arguments", {})
-            if tool_name:
-                return {"name": tool_name, "args": tool_args}
-        except json.JSONDecodeError:
-            pass
-
-    # --- Strategy 2: JSON array [{...}] (Qwen/DeepSeek eval format) ---
-    arr_match = JSON_ARRAY_RE.search(text)
-    if arr_match:
-        try:
-            arr = json.loads(arr_match.group(0))
-            if isinstance(arr, list) and len(arr) > 0:
-                item = arr[0]
-                tool_name = item.get("tool") or item.get("name")
-                tool_args = item.get("args") or item.get("arguments", {})
-                if tool_name:
-                    return {"name": tool_name, "args": tool_args}
-        except json.JSONDecodeError:
-            pass
-
-    # --- Strategy 3: bare JSON object {"name":..., "arguments":...} ---
-    for block in BRACE_BLOCK_RE.findall(text):
-        try:
-            data = json.loads(block.strip())
-            tool_name = data.get("tool") or data.get("name")
-            tool_args = data.get("args") or data.get("arguments", {})
-            if tool_name:
-                return {"name": tool_name, "args": tool_args}
-        except json.JSONDecodeError:
-            continue
-
-    return None
-
-
 def _execute_sql(sql: str) -> dict:
+    """Execute SQL against DuckDB. Returns {columns, rows, error, row_count}."""
     conn = duckdb.connect(DB_PATH)
     try:
-        sql = re.sub(r"^```sql\s*", "", sql.strip())
-        sql = re.sub(r"^```\s*", "", sql)
-        sql = re.sub(r"\s*```$", "", sql)
-        result = conn.execute(sql)
+        sql_clean = sql.strip()
+        for prefix in ("```sql\n", "```\n", "```sql", "```"):
+            if sql_clean.startswith(prefix):
+                sql_clean = sql_clean[len(prefix) :]
+        if sql_clean.endswith("```"):
+            sql_clean = sql_clean[:-3]
+        result = conn.execute(sql_clean.strip())
         columns = [desc[0] for desc in result.description]
-        # Deduplicate columns from JOINs (e.g., SELECT * produces duplicate customer_id)
-        seen = {}
-        deduped = []
+        seen: dict[str, int] = {}
+        deduped: list[str] = []
         for c in columns:
             if c in seen:
                 seen[c] += 1
@@ -184,6 +139,7 @@ def _execute_sql(sql: str) -> dict:
 
 
 def _format_rows(columns: list[str], rows: list) -> str:
+    """Format query results as a pipe-delimited text table."""
     if not rows:
         return "Query returned 0 rows."
     header = " | ".join(columns)
@@ -195,85 +151,94 @@ def _format_rows(columns: list[str], rows: list) -> str:
     return "\n".join(lines)
 
 
-def _classify_question(question: str, client: OpenAI) -> tuple[str | None, Any]:
-    classify_prompt = f"""\
-You are a classifier. Respond ONLY with a tool call.
+def _execute_tool(name: str, args: dict) -> str:
+    """Execute a single tool call and return the result string."""
+    if name == "load_skill":
+        skill = args.get("skill", "")
+        if skill in SKILLS:
+            return SKILLS[skill] + "\n\nNow call run_sql with your SQL query."
+        return f"Unknown skill: {skill}. Available: {list(SKILLS.keys())}"
 
-Question: {question}
+    elif name == "run_sql":
+        sql = args.get("sql", "")
+        result = _execute_sql(sql)
+        if result["error"]:
+            return (
+                f"Error: {result['error']}\n\n"
+                f"{SKILLS['duckdb-rules']}\n\n"
+                f"Fix the query and call run_sql again, or call schema_check to verify columns."
+            )
+        formatted = _format_rows(result["columns"], result["rows"])
+        return formatted + "\n\nNow call explain to summarize these results."
 
-Functions:
-- load_skill(skill: "loan-analysis" | "customer-insights" | "transaction-analysis" | "account-overview")
+    elif name == "schema_check":
+        table = args.get("table", "")
+        columns = schema_lookup(table)
+        return columns + "\n\nNow fix your query and call run_sql."
 
-Pick the ONE most relevant skill. Respond with the function call."""
+    elif name == "explain":
+        return args.get("text", "")
 
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[{"role": "system", "content": classify_prompt}],
-        temperature=0.0,
-        max_tokens=300,   # Increased — reasoning model may output thinking first
-    )
-    text = response.choices[0].message.content or ""
-    tc = _parse_tool_call(text)
-    if tc and tc["name"] == "load_skill":
-        return tc["args"].get("skill"), tc
-    # Fallback: try to extract skill name from raw text
-    skill_match = re.search(r"loan-analysis|customer-insights|transaction-analysis|account-overview", text)
-    if skill_match:
-        return skill_match.group(0), None
-    return None, None
-
-
-def _append_assistant(messages: list[dict], content: str) -> None:
-    messages.append({"role": "assistant", "content": content})
-
-
-def _feed_tool_response(messages: list[dict], content: str) -> None:
-    """Feed a tool response back to the model in Hermes native format."""
-    messages.append({"role": "user", "content": f"<tool_response>\n{content}\n</tool_response>"})
+    return f"Unknown tool: {name}"
 
 
-def run_agent(question: str, on_step=None, context_history: list[dict] | None = None) -> dict:
+def _estimate_tokens(messages: list[dict]) -> int:
+    return sum(len(str(m.get("content", ""))) for m in messages) // 4
+
+
+def _maybe_compress(messages: list[dict], client: OpenAI) -> tuple[list[dict], bool]:
+    if len(messages) <= 8:
+        return messages, False
+    if _estimate_tokens(messages) > int(N_CTX * CTX_THRESHOLD):
+        return [messages[0]] + messages[-7:], True
+    return messages, False
+
+
+# --- Main Agent Loop ---
+
+def run_agent(
+    question: str,
+    on_step: Any = None,
+    context_history: list[dict] | None = None,
+) -> dict:
+    """Run the NL2SQL agent with native function calling.
+
+    Returns:
+        dict with keys: answer, sql, results, sql_history, retries, trips, steps, skill_used
+    """
     client = _get_client()
-    steps = []
+    steps: list[dict] = []
     retries = 0
     trips_used = 0
+    sql_history: list[str] = []
+    final_answer: str | None = None
+    skill_used = "customer-insights"
 
     def _step(name: str, data: Any = None):
         steps.append({"name": name, "data": data})
         if on_step:
             on_step(name, data)
 
-    _step("classify", question)
-    skill_name, _ = _classify_question(question, client)
-    trips_used += 1
-    _step("skill_loaded", skill_name)
+    _step("start", question)
 
-    if skill_name is None:
-        skill_name = "customer-insights"
-        _step("fallback_skill", skill_name)
+    # Build initial messages
+    full_system = SYSTEM_PROMPT + "\n\n" + SKILLS["duckdb-rules"]
+    messages: list[dict] = [{"role": "system", "content": full_system}]
 
-    skill_text = SKILLS.get(skill_name, SKILLS["customer-insights"])
-    full_system = SYSTEM_PROMPT + "\n\n" + skill_text + "\n\n" + SKILLS["duckdb-rules"]
-
-    messages = [
-        {"role": "system", "content": full_system},
-    ]
-
-    # Inject previous Q&A pairs as multi-turn context (questions + sql + explain outputs)
-    # Injected as "user" role so the system prompt's tool-calling mandate stays authoritative
+    # Inject previous Q&A pairs for multi-turn follow-up resolution
     if context_history:
         history_block = "Previous conversation:\n"
         for i, entry in enumerate(context_history, 1):
             history_block += f"\n[Q{i}] {entry['question']}\n"
-            history_block += f"[SQL{i}] {entry['sql']}\n"
-            history_block += f"[A{i}] {entry['answer']}\n"
-        history_block += "\n(Use the above Q&A context to resolve follow-up references like 'them', 'it', 'those'. Reuse SQL WHERE clauses from previous queries when composing new ones.)"
+            history_block += f"[SQL{i}] {entry.get('sql', '')}\n"
+            history_block += f"[A{i}] {entry.get('answer', '')}\n"
+        history_block += (
+            "\n(Use the above to resolve references like 'them', 'it', 'those'."
+            " Reuse SQL WHERE clauses from previous queries when composing new ones.)"
+        )
         messages.append({"role": "user", "content": history_block})
 
     messages.append({"role": "user", "content": question})
-
-    sql_history = []
-    final_answer = None
 
     while trips_used < MAX_TRIPS:
         trips_used += 1
@@ -284,68 +249,79 @@ def run_agent(question: str, on_step=None, context_history: list[dict] | None = 
         response = client.chat.completions.create(
             model=MODEL_NAME,
             messages=messages,
+            tools=TOOLS,
+            tool_choice="auto",
             temperature=0.0,
-            max_tokens=1500,   # Increased from 800 — model may output reasoning first
+            max_tokens=1500,
         )
-        text = response.choices[0].message.content or ""
-        _append_assistant(messages, text)
+        msg = response.choices[0].message
 
-        tc = _parse_tool_call(text)
-
-        if tc is None:
-            # No tool call found — check if this is a plain text answer
-            if text.strip():
-                final_answer = text.strip()
+        # No tool calls — model responded with text (final answer or error)
+        if not msg.tool_calls:
+            if msg.content and msg.content.strip():
+                final_answer = msg.content.strip()
                 _step("text_response", final_answer)
             else:
                 final_answer = "Agent produced no output."
-                _step("empty_response", None)
+            messages.append({"role": "assistant", "content": msg.content or ""})
             break
 
-        _step(f"tool:{tc['name']}", tc["args"])
+        # Append the assistant message with its tool calls
+        messages.append({
+            "role": "assistant",
+            "content": msg.content,
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in msg.tool_calls
+            ],
+        })
 
-        if tc["name"] == "load_skill":
-            skill = tc["args"].get("skill", "")
-            if skill in SKILLS:
-                _feed_tool_response(messages, SKILLS[skill] + "\n\nNow call run_sql with your SQL query.")
-                _step("skill_injected", skill)
-            continue
+        # Execute each tool call and feed results back
+        for tc in msg.tool_calls:
+            tool_name = tc.function.name
+            try:
+                tool_args = json.loads(tc.function.arguments)
+            except json.JSONDecodeError:
+                tool_args = {}
 
-        elif tc["name"] == "run_sql":
-            sql = tc["args"].get("sql", "")
-            sql_history.append(sql)
-            result = _execute_sql(sql)
+            _step(f"tool:{tool_name}", tool_args)
 
-            if result["error"]:
-                content = f"Error: {result['error']}"
-                if "duckdb-rules" not in str(messages[-6:]):
-                    content += f"\n\n{SKILLS['duckdb-rules']}"
-                content += "\n\nFix the query and call run_sql again, or call schema_check to verify columns."
-                _feed_tool_response(messages, content)
+            if tool_name == "load_skill":
+                skill_used = tool_args.get("skill", skill_used)
+
+            result_text = _execute_tool(tool_name, tool_args)
+
+            if tool_name == "run_sql":
+                sql_history.append(tool_args.get("sql", ""))
+
+            if tool_name == "explain":
+                final_answer = tool_args.get("text", "")
+
+            if tool_name == "run_sql" and "Error:" in result_text:
                 retries += 1
-                _step("sql_error", result["error"])
-            else:
-                formatted = _format_rows(result["columns"], result["rows"])
-                _feed_tool_response(messages, formatted + "\n\nNow call explain to summarize these results.")
-                _step("sql_success", {"columns": result["columns"], "row_count": result["row_count"]})
-            continue
+                _step("sql_error", result_text[:200])
+            elif tool_name == "run_sql":
+                _step("sql_success", {"preview": result_text[:200]})
 
-        elif tc["name"] == "schema_check":
-            table = tc["args"].get("table", "")
-            columns = schema_lookup(table)
-            _feed_tool_response(messages, columns + "\n\nNow fix your query and call run_sql.")
-            _step("schema_checked", table)
-            continue
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": result_text,
+            })
 
-        elif tc["name"] == "explain":
-            final_answer = tc["args"].get("text", "")
-            _step("explain", final_answer)
+        # If explain was called, we're done
+        if final_answer is not None:
             break
 
     last_sql = sql_history[-1] if sql_history else None
-    last_result = None
-    if last_sql:
-        last_result = _execute_sql(last_sql)
+    last_result = _execute_sql(last_sql) if last_sql else None
 
     return {
         "answer": final_answer or "Agent could not respond within the step limit.",
@@ -355,5 +331,5 @@ def run_agent(question: str, on_step=None, context_history: list[dict] | None = 
         "retries": retries,
         "trips": trips_used,
         "steps": steps,
-        "skill_used": skill_name,
+        "skill_used": skill_used,
     }
