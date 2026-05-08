@@ -79,23 +79,20 @@ def extract_sql_from_tool_calls(tool_calls: list) -> str | None:
 
 
 def test_sql_generation(client: OpenAI, model: str, queries: list[dict]) -> list[dict]:
-    """Test SQL generation by giving the model full context and asking it to call run_sql."""
+    """Test SQL generation in a short two-turn conversation.
+
+    Turn 1: Model calls load_skill, we return the skill card.
+    Turn 2: Model calls run_sql with the generated query.
+    """
     results = []
     for q in queries:
         start = time.time()
         try:
-            skill_text = SKILLS.get(q["skill"], "")
-            system = (
-                SYSTEM_PROMPT
-                + "\n\n"
-                + skill_text
-                + "\n\n"
-                + SKILLS["duckdb-rules"]
-            )
-            resp = client.chat.completions.create(
+            # Turn 1: model sees the workflow, calls load_skill
+            resp1 = client.chat.completions.create(
                 model=model,
                 messages=[
-                    {"role": "system", "content": system},
+                    {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": q["question"]},
                 ],
                 tools=TOOLS,
@@ -103,51 +100,98 @@ def test_sql_generation(client: OpenAI, model: str, queries: list[dict]) -> list
                 temperature=0.0,
                 max_tokens=1500,
             )
+            msg1 = resp1.choices[0].message
+            tokens = resp1.usage.completion_tokens if resp1.usage else 0
+
+            if not msg1.tool_calls:
+                results.append({
+                    "id": q["id"], "question": q["question"],
+                    "difficulty": q["difficulty"], "passed": False,
+                    "sql": None, "missing_patterns": q["sql_must_contain"],
+                    "elapsed_s": round(time.time() - start, 2),
+                    "error": "Model did not call any tool on turn 1",
+                })
+                continue
+
+            # Feed the requested skill card
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": q["question"]},
+            ]
+            for tc in msg1.tool_calls:
+                messages.append({
+                    "role": "assistant",
+                    "content": msg1.content,
+                    "tool_calls": [{
+                        "id": tc.id, "type": "function",
+                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                    }],
+                })
+                tool_name = tc.function.name
+                try:
+                    tool_args = json.loads(tc.function.arguments)
+                except json.JSONDecodeError:
+                    tool_args = {}
+
+                if tool_name == "load_skill":
+                    skill = tool_args.get("skill", q["skill"])
+                    card = SKILLS.get(skill, SKILLS.get(q["skill"], ""))
+                    result = card + "\n\nNow call run_sql with your SQL query."
+                else:
+                    result = f"Tool {tool_name} result placeholder."
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result,
+                })
+
+            # Add duckdb-rules to system
+            messages[0]["content"] += "\n\n" + SKILLS["duckdb-rules"]
+
+            # Turn 2: model should call run_sql
+            resp2 = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=TOOLS,
+                tool_choice="auto",
+                temperature=0.0,
+                max_tokens=1500,
+            )
+            msg2 = resp2.choices[0].message
+            tokens += resp2.usage.completion_tokens if resp2.usage else 0
             elapsed = time.time() - start
-            msg = resp.choices[0].message
-            tokens = resp.usage.completion_tokens if resp.usage else 0
 
             sql = None
-            if msg.tool_calls:
-                sql = extract_sql_from_tool_calls(msg.tool_calls)
+            all_tools = [tc.function.name for tc in msg1.tool_calls]
+            if msg2.tool_calls:
+                all_tools += [tc.function.name for tc in msg2.tool_calls]
+                sql = extract_sql_from_tool_calls(msg2.tool_calls)
 
             if sql:
                 passed, missing = check_sql(sql, q["sql_must_contain"])
                 results.append({
-                    "id": q["id"],
-                    "question": q["question"],
-                    "difficulty": q["difficulty"],
-                    "passed": passed,
-                    "sql": sql,
-                    "missing_patterns": missing,
+                    "id": q["id"], "question": q["question"],
+                    "difficulty": q["difficulty"], "passed": passed,
+                    "sql": sql, "missing_patterns": missing,
                     "elapsed_s": round(elapsed, 2),
-                    "completion_tokens": tokens,
-                    "tool_calls": [tc.function.name for tc in msg.tool_calls],
+                    "completion_tokens": tokens, "tool_calls": all_tools,
                 })
             else:
-                # Model didn't call run_sql — check if it called explain directly
-                tc_names = [tc.function.name for tc in msg.tool_calls] if msg.tool_calls else []
                 results.append({
-                    "id": q["id"],
-                    "question": q["question"],
-                    "difficulty": q["difficulty"],
-                    "passed": False,
-                    "sql": None,
-                    "missing_patterns": q["sql_must_contain"],
+                    "id": q["id"], "question": q["question"],
+                    "difficulty": q["difficulty"], "passed": False,
+                    "sql": None, "missing_patterns": q["sql_must_contain"],
                     "elapsed_s": round(elapsed, 2),
-                    "completion_tokens": tokens,
-                    "tool_calls": tc_names,
-                    "raw_content": (msg.content or "")[:200],
+                    "completion_tokens": tokens, "tool_calls": all_tools,
+                    "raw_content": (msg2.content or "")[:200],
                 })
 
         except Exception as e:
             results.append({
-                "id": q["id"],
-                "question": q["question"],
-                "difficulty": q["difficulty"],
-                "passed": False,
-                "error": str(e),
-                "elapsed_s": round(time.time() - start, 2),
+                "id": q["id"], "question": q["question"],
+                "difficulty": q["difficulty"], "passed": False,
+                "error": str(e), "elapsed_s": round(time.time() - start, 2),
             })
 
     return results
