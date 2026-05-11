@@ -359,3 +359,240 @@ def run_agent(
         "steps": steps,
         "skill_used": skill_used,
     }
+
+
+# --- Streaming Agent Loop ---
+
+def _stream_llm_response(client: OpenAI, messages: list[dict], tools: list[dict],
+                         temperature: float = 0.0, max_tokens: int = 1500):
+    """Stream an LLM response and yield events as they arrive.
+
+    Yields:
+        {"type": "text_chunk", "content": "..."}     — partial text token
+        {"type": "tool_call", "id": ..., "name": ..., "args": {...}}  — complete tool call
+        {"type": "stream_end", "content": "...", "tool_calls": [...]}
+    """
+    stream = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=messages,
+        tools=tools,
+        tool_choice="auto",
+        temperature=temperature,
+        max_tokens=max_tokens,
+        stream=True,
+    )
+
+    content = ""
+    tool_calls_acc: dict[int, dict] = {}  # index → {id, function: {name, arguments}}
+
+    for chunk in stream:
+        delta = chunk.choices[0].delta if chunk.choices else None
+        if delta is None:
+            continue
+
+        # Streaming text (may be reasoning, thinking, or final answer)
+        if delta.content:
+            content += delta.content
+            yield {"type": "text_chunk", "content": delta.content}
+
+        # Accumulate tool calls — arguments arrive in pieces across chunks
+        if delta.tool_calls:
+            for tc in delta.tool_calls:
+                idx = tc.index
+                if idx not in tool_calls_acc:
+                    tool_calls_acc[idx] = {
+                        "id": "",
+                        "function": {"name": "", "arguments": ""},
+                    }
+                entry = tool_calls_acc[idx]
+                if tc.id:
+                    entry["id"] = tc.id
+                if tc.function and tc.function.name:
+                    entry["function"]["name"] = tc.function.name
+                if tc.function and tc.function.arguments:
+                    entry["function"]["arguments"] += tc.function.arguments
+
+        finish = chunk.choices[0].finish_reason if chunk.choices else None
+        if finish:
+            break
+
+    # Yield each complete tool call (arguments now fully assembled)
+    assembled: list[dict] = []
+    for idx in sorted(tool_calls_acc.keys()):
+        tc = tool_calls_acc[idx]
+        try:
+            args = json.loads(tc["function"]["arguments"])
+        except (json.JSONDecodeError, KeyError):
+            args = {}
+        assembled.append(tc)
+        yield {
+            "type": "tool_call",
+            "id": tc["id"],
+            "name": tc["function"]["name"],
+            "args": args,
+        }
+
+    yield {"type": "stream_end", "content": content, "tool_calls": assembled}
+
+
+def run_agent_stream(
+    question: str,
+    context_history: list[dict] | None = None,
+):
+    """Run the NL2SQL agent with streaming — yields events for live UI updates.
+
+    Yields events:
+        {"type": "step", "name": "start", "data": question}
+        {"type": "tool_call", "name": ..., "id": ..., "args": {...}}
+        {"type": "tool_result", "name": ..., "content": ..., "results": {...} | None}
+        {"type": "sql_error", "error": "..."}
+        {"type": "text_chunk", "content": "..."}
+        {"type": "done", "data": result_dict}
+    """
+    client = _get_client()
+    retries = 0
+    trips_used = 0
+    sql_history: list[str] = []
+    final_answer: str | None = None
+    skill_used = "customer-insights"
+
+    yield {"type": "step", "name": "start", "data": question}
+
+    # Build initial messages
+    full_system = SYSTEM_PROMPT + "\n\n" + SKILLS["duckdb-rules"]
+    messages: list[dict] = [{"role": "system", "content": full_system}]
+
+    # Inject multi-turn context
+    if context_history:
+        history_block = "Previous conversation (for context — resolve references like 'them', 'it', 'those'):\n"
+        for i, entry in enumerate(context_history, 1):
+            history_block += f"\n[Q{i}] {entry['question']}\n"
+            skill = entry.get("skill", "")
+            if skill:
+                history_block += f"[Skill] {skill}\n"
+            results_summary = entry.get("results_summary", "")
+            if results_summary:
+                history_block += f"[Results] {results_summary}\n"
+            history_block += f"[A{i}] {entry['answer']}\n"
+        history_block += (
+            "\n(Use the above to resolve references like 'them', 'it', 'those'."
+            " Reuse SQL WHERE clauses from previous queries when composing new ones.)"
+        )
+        messages.append({"role": "user", "content": history_block})
+
+    messages.append({"role": "user", "content": question})
+
+    while trips_used < MAX_TRIPS:
+        trips_used += 1
+        messages, compressed = _maybe_compress(messages, client)
+        if compressed:
+            yield {"type": "step", "name": "context_compressed"}
+
+        # Stream the LLM response
+        tool_calls_this_turn: list[dict] = []
+        for event in _stream_llm_response(client, messages, TOOLS):
+            if event["type"] == "text_chunk":
+                yield event  # pass through streaming text
+
+            elif event["type"] == "tool_call":
+                tool_calls_this_turn.append(event)
+                tc_name = event["name"]
+                tc_args = event["args"]
+
+                # Yield tool_call for UI
+                yield event
+
+                # Track state
+                if tc_name == "load_skill":
+                    skill_used = tc_args.get("skill", skill_used)
+
+                # Execute the tool
+                result_text = _execute_tool(tc_name, tc_args)
+
+                # Stash result so stream_end can reuse it (avoid double execution)
+                event["_result"] = result_text
+
+                if tc_name == "run_sql":
+                    sql_history.append(tc_args.get("sql", ""))
+
+                if tc_name == "explain":
+                    final_answer = tc_args.get("text", "")
+
+                # Determine if SQL error
+                if tc_name == "run_sql" and "Error:" in result_text:
+                    retries += 1
+                    yield {"type": "sql_error", "error": result_text[:300]}
+
+                # Yield tool result for UI (include parsed results for SQL queries)
+                tool_result_event: dict = {
+                    "type": "tool_result",
+                    "name": tc_name,
+                    "id": event.get("id", ""),
+                    "content": result_text,
+                    "results": None,
+                }
+                if tc_name == "run_sql":
+                    sql_args = tc_args.get("sql", "")
+                    exec_result = _execute_sql(sql_args)
+                    tool_result_event["results"] = exec_result if not exec_result.get("error") else None
+
+                yield tool_result_event
+
+            elif event["type"] == "stream_end":
+                # Build assistant message from this turn
+                assistant_content = event.get("content", "")
+                assistant_msg: dict = {
+                    "role": "assistant",
+                    "content": assistant_content,
+                }
+                if event.get("tool_calls"):
+                    assistant_msg["tool_calls"] = [
+                        {
+                            "id": tc["id"],
+                            "type": "function",
+                            "function": {
+                                "name": tc["function"]["name"],
+                                "arguments": tc["function"]["arguments"],
+                            },
+                        }
+                        for tc in event["tool_calls"]
+                    ]
+                messages.append(assistant_msg)
+
+                # Append tool responses (reuse stashed results — no double execution)
+                for tc in tool_calls_this_turn:
+                    tc_name = tc["name"]
+                    tc_id = tc.get("id", "")
+                    result_text = tc.get("_result",
+                        _execute_tool(tc_name, tc.get("args", {})))
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc_id,
+                        "content": result_text,
+                    })
+
+                # If no tool calls this turn, model gave a text-only response
+                if not tool_calls_this_turn:
+                    if assistant_content and assistant_content.strip():
+                        final_answer = assistant_content.strip()
+                    else:
+                        final_answer = "Agent produced no output."
+                    break
+
+        # Check if we're done
+        if final_answer is not None:
+            break
+
+    last_sql = sql_history[-1] if sql_history else None
+    last_result = _execute_sql(last_sql) if last_sql else None
+
+    result = {
+        "answer": final_answer or "Agent could not respond within the step limit.",
+        "sql": last_sql,
+        "results": last_result,
+        "sql_history": sql_history,
+        "retries": retries,
+        "trips": trips_used,
+        "skill_used": skill_used,
+    }
+    yield {"type": "done", "data": result}

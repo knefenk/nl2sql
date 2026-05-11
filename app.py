@@ -1,9 +1,9 @@
-"""Streamlit chat UI for the NL2SQL agent."""
+"""Streamlit chat UI for the NL2SQL agent — with live streaming."""
 
 import streamlit as st
 import pandas as pd
 
-from agent import run_agent, _summarize_results
+from agent import run_agent_stream, _summarize_results
 
 st.set_page_config(page_title="NL2SQL Agent", layout="wide")
 
@@ -28,54 +28,29 @@ if "qa_history" not in st.session_state:
 
 
 def _render_result(result: dict):
-    """Render agent tool calls chronologically, explain at bottom."""
-    steps = result.get("steps", [])
-    table_shown = False
+    """Render agent result for historical messages (no streaming)."""
+    answer = result.get("answer", "")
+    results = result.get("results")
 
-    for step in steps:
-        name = step["name"]
-        data = step.get("data")
+    # Show results table if available
+    if results and results.get("rows"):
+        df = pd.DataFrame(results["rows"], columns=results["columns"])
+        st.caption(f"{len(df)} rows")
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
-        if name == "tool:load_skill":
-            skill = data.get("skill", "unknown") if isinstance(data, dict) else str(data)
-            with st.expander(f"load_skill: {skill}", expanded=False):
-                from skills import SKILLS
-                content = SKILLS.get(skill, "Skill not found.")
-                st.text(content[:1500])
-                if len(content) > 1500:
-                    st.caption("(truncated)")
-
-        elif name == "tool:run_sql":
-            sql = data.get("sql", "") if isinstance(data, dict) else str(data)
+    # Show SQL if available
+    sql = result.get("sql", "")
+    if sql:
+        with st.expander("SQL", expanded=False):
             st.code(sql, language="sql")
 
-        elif name == "sql_error":
-            st.error(f"SQL error: {data}")
-
-        elif name == "sql_success" and not table_shown:
-            table_shown = True
-            res = result.get("results")
-            if res and res.get("rows"):
-                df = pd.DataFrame(res["rows"], columns=res["columns"])
-                st.caption(f"{len(df)} rows")
-                st.dataframe(df, use_container_width=True, hide_index=True)
-
-        elif name == "tool:schema_check":
-            table = data.get("table", "") if isinstance(data, dict) else str(data)
-            st.caption(f"Checking schema for: {table}")
-
-        elif name == "context_compressed":
-            st.caption("Context compressed to stay within token limit.")
-
-    # Explanation at the bottom
-    answer = result.get("answer", "")
+    # Answer text
     if answer and answer != "Agent could not respond within the step limit.":
         st.markdown(answer)
-    elif not (result.get("results") and result["results"].get("rows")):
-        if result.get("retries", 0) > 0:
-            st.error(f"Query failed after {result['retries']} retries.")
-        else:
-            st.info("No results found.")
+    elif result.get("retries", 0) > 0:
+        st.error(f"Query failed after {result['retries']} retries.")
+    elif not (results and results.get("rows")):
+        st.info("No results found.")
 
     # Footer
     st.caption(
@@ -86,27 +61,136 @@ def _render_result(result: dict):
 
 
 def _handle_query(question: str) -> dict:
-    with st.spinner(""):
-        result = run_agent(question, context_history=st.session_state.qa_history[-10:])
-    _render_result(result)
+    """Run a query with live streaming UI, record context for follow-ups."""
+    with st.chat_message("assistant"):
+        # ── Live progress container ──
+        status = st.status("Thinking...", expanded=True)
 
-    # Record Q&A for multi-turn context
-    # Skip entries with SQL errors — those answers are likely wrong
-    answer = result.get("answer", "")
-    sql = result.get("sql", "")
-    retries = result.get("retries", 0)
-    if answer and answer != "Agent could not respond within the step limit." and retries == 0 and sql:
-        st.session_state.qa_history.append({
-            "question": question,
-            "answer": answer,
-            "skill": result.get("skill_used", ""),
-            "results_summary": _summarize_results(result.get("results")),
-        })
+        # Dynamic placeholders (outside status — persist after collapse)
+        sql_placeholder = st.empty()
+        results_placeholder = st.empty()
+        answer_placeholder = st.empty()
+        footer_placeholder = st.empty()
 
-    return result
+        answer_text = ""
+        result_data: dict = {}
+
+        for event in run_agent_stream(
+            question, context_history=st.session_state.qa_history[-10:]
+        ):
+            ev_type = event["type"]
+
+            # ── Step events ──
+            if ev_type == "step":
+                if event["name"] == "start":
+                    status.write(f"**Processing:** {event.get('data', '')[:100]}...")
+                elif event["name"] == "context_compressed":
+                    status.write("📦 Context compressed to stay within token limit")
+
+            # ── Tool calls ──
+            elif ev_type == "tool_call":
+                name = event["name"]
+                if name == "load_skill":
+                    status.write(f"🔍 Loading domain skill: **{event['args'].get('skill', '?')}**")
+                elif name == "run_sql":
+                    status.write("📊 Running SQL query...")
+                    sql_placeholder.code(event["args"].get("sql", ""), language="sql")
+                elif name == "schema_check":
+                    status.write(f"🔍 Checking schema: **{event['args'].get('table', '?')}**")
+                elif name == "explain":
+                    status.write("💬 Generating explanation...")
+                    # Clear any prior SQL display since we're done querying
+                    sql_placeholder.empty()
+
+            # ── Tool results ──
+            elif ev_type == "tool_result":
+                name = event["name"]
+                if name == "load_skill":
+                    status.write("✓ Skill loaded — generating query...")
+                elif name == "run_sql":
+                    res = event.get("results")
+                    if res and res.get("rows"):
+                        df = pd.DataFrame(res["rows"], columns=res["columns"])
+                        status.write(f"✓ Query returned **{len(df)} rows**")
+                        results_placeholder.dataframe(
+                            df, use_container_width=True, hide_index=True
+                        )
+                    elif res:
+                        status.write("✓ Query returned 0 rows")
+                    else:
+                        status.write("✓ Query executed")
+                elif name == "schema_check":
+                    status.write("✓ Schema checked — regenerating query...")
+
+            # ── SQL errors ──
+            elif ev_type == "sql_error":
+                status.write(f"❌ SQL error — auto-correcting...")
+                # Clear bad SQL and stale results
+                sql_placeholder.empty()
+                results_placeholder.empty()
+
+            # ── Streaming text (final explain) ──
+            elif ev_type == "text_chunk":
+                chunk = event["content"]
+                # Strip thinking blocks from display
+                if not chunk.strip():
+                    continue
+                answer_text += chunk
+                # Show text with cursor while streaming
+                answer_placeholder.markdown(answer_text + " ▌")
+
+            # ── Done ──
+            elif ev_type == "done":
+                result_data = event["data"]
+                # Replace cursor with final answer
+                final_answer = result_data.get("answer", answer_text)
+                if (
+                    final_answer
+                    and final_answer != "Agent could not respond within the step limit."
+                ):
+                    answer_placeholder.markdown(final_answer)
+                else:
+                    if result_data.get("retries", 0) > 0:
+                        answer_placeholder.error(
+                            f"Query failed after {result_data['retries']} retries."
+                        )
+                    else:
+                        answer_placeholder.info("No results found.")
+
+                status.update(label="Complete ✓", state="complete", expanded=False)
+
+                footer_placeholder.caption(
+                    f"skill: {result_data.get('skill_used', '?')}  |  "
+                    f"trips: {result_data.get('trips', 0)}  |  "
+                    f"retries: {result_data.get('retries', 0)}"
+                )
+
+    # ── Record multi-turn context ──
+    answer = result_data.get("answer", "")
+    sql = result_data.get("sql", "")
+    retries = result_data.get("retries", 0)
+    if (
+        answer
+        and answer != "Agent could not respond within the step limit."
+        and retries == 0
+        and sql
+    ):
+        st.session_state.qa_history.append(
+            {
+                "question": question,
+                "answer": answer,
+                "skill": result_data.get("skill_used", ""),
+                "results_summary": _summarize_results(result_data.get("results")),
+            }
+        )
+
+    return result_data
 
 
-# --- Sidebar ---
+# ═══════════════════════════════════════════════════════════════
+# Sidebar
+# ═══════════════════════════════════════════════════════════════
+
 with st.sidebar:
     st.header("Sample Questions")
     for q in SAMPLE_QUESTIONS:
@@ -124,15 +208,23 @@ with st.sidebar:
     st.divider()
     st.header("About")
     st.markdown(
-        "NL2SQL agent powered by Qwen3.5-9B (DeepSeek V4 distilled) running locally via llama.cpp. "
-        "Uses native function calling, domain skill cards, self-correcting SQL, and schema-aware retry."
+        "NL2SQL agent powered by Qwen3.5-9B (DeepSeek V4 distilled) "
+        "running locally via llama.cpp. Uses native function calling, "
+        "domain skill cards, self-correcting SQL, schema-aware retry, "
+        "and live token-by-token streaming."
     )
 
-# --- Header ---
+# ═══════════════════════════════════════════════════════════════
+# Header
+# ═══════════════════════════════════════════════════════════════
+
 st.title("NL2SQL Agent")
 st.caption("Ask questions about the financial database in plain English.")
 
-# --- Chat history ---
+# ═══════════════════════════════════════════════════════════════
+# Chat history
+# ═══════════════════════════════════════════════════════════════
+
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         if msg["role"] == "assistant":
@@ -140,24 +232,33 @@ for msg in st.session_state.messages:
         else:
             st.markdown(msg["content"])
 
-# --- Chat input ---
+# ═══════════════════════════════════════════════════════════════
+# Chat input
+# ═══════════════════════════════════════════════════════════════
+
 if question := st.chat_input("Ask a question about the financial database..."):
     st.session_state.messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.markdown(question)
 
-    with st.chat_message("assistant"):
-        result = _handle_query(question)
-    st.session_state.messages.append({"role": "assistant", "content": question, "data": result})
+    result = _handle_query(question)
+    st.session_state.messages.append(
+        {"role": "assistant", "content": question, "data": result}
+    )
     st.rerun()
 
-# --- Sample question click ---
+# ═══════════════════════════════════════════════════════════════
+# Sample question click
+# ═══════════════════════════════════════════════════════════════
+
 if "pending_question" in st.session_state:
     q = st.session_state.pop("pending_question")
     st.session_state.messages.append({"role": "user", "content": q})
     with st.chat_message("user"):
         st.markdown(q)
-    with st.chat_message("assistant"):
-        result = _handle_query(q)
-    st.session_state.messages.append({"role": "assistant", "content": q, "data": result})
+
+    result = _handle_query(q)
+    st.session_state.messages.append(
+        {"role": "assistant", "content": q, "data": result}
+    )
     st.rerun()
